@@ -1,5 +1,7 @@
-from ai.hf_client import hf_client
 from typing import List, Dict
+import logging
+
+logger = logging.getLogger(__name__)
 
 class BasicDataProcessor:
     def __init__(self):
@@ -7,6 +9,18 @@ class BasicDataProcessor:
             "music_festival", "food_festival", "art_festival", 
             "cultural_festival", "outdoor_festival", "general"
         ]
+        self.hf_client = None
+        self._init_hf_client()
+    
+    def _init_hf_client(self):
+        """Initialize Hugging Face client safely"""
+        try:
+            from ai.hf_client import hf_client
+            self.hf_client = hf_client
+            logger.info("✅ Hugging Face client initialized successfully")
+        except Exception as e:
+            logger.warning(f"⚠️ Hugging Face client not available: {e}")
+            self.hf_client = None
     
     async def process_festival(self, festival_data: Dict) -> Dict:
         """Basic festival processing"""
@@ -15,11 +29,15 @@ class BasicDataProcessor:
         # Basic category assignment
         processed['category'] = self._assign_category(festival_data)
         
-        # Basic sentiment analysis
+        # Basic sentiment analysis (if HF client available)
         text = festival_data.get('description', festival_data.get('name', ''))
-        if text:
-            sentiment = await hf_client.analyze_sentiment(text)
-            processed['sentiment_score'] = sentiment['score']
+        if text and self.hf_client:
+            try:
+                sentiment = await self.hf_client.analyze_sentiment(text)
+                processed['sentiment_score'] = sentiment['score']
+            except Exception as e:
+                logger.warning(f"Sentiment analysis failed: {e}")
+                processed['sentiment_score'] = 0.5
         else:
             processed['sentiment_score'] = 0.5
         

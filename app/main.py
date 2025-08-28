@@ -1,9 +1,12 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional, List
 import logging
 
-from app.models import FestivalResponse, FestivalListResponse, FestivalCreate
+from app.models import (
+    FestivalResponse, FestivalListResponse, FestivalCreate, FestivalUpdate,
+    FestivalSearchRequest, FestivalStatsResponse
+)
 from app.database import supabase_manager
 from ai.data_processor import data_processor
 
@@ -12,9 +15,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="Festival Finder",
-    description="AI-Enhanced Festival Discovery",
-    version="1.0.0"
+    title="AI Festival Scraper",
+    description="AI-Enhanced Festival Discovery with Sentiment Analysis and Smart Recommendations",
+    version="2.0.0"
 )
 
 # CORS middleware
@@ -28,7 +31,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("🚀 Festival App Starting...")
+    logger.info("🚀 AI Festival App Starting...")
     try:
         # Test Supabase connection
         result = await supabase_manager.get_festivals(limit=1)
@@ -38,34 +41,57 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    return {"message": "Festival Finder API", "status": "running"}
+    return {
+        "message": "AI Festival Scraper API", 
+        "status": "running",
+        "version": "2.0.0",
+        "features": [
+            "AI-powered sentiment analysis",
+            "Smart festival categorization",
+            "Popularity scoring",
+            "Advanced search and filtering",
+            "Festival statistics and insights"
+        ]
+    }
 
 @app.get("/api/festivals", response_model=FestivalListResponse)
 async def get_festivals(
     city: Optional[str] = Query(None, description="Filter by city"),
+    state: Optional[str] = Query(None, description="Filter by state"),
     category: Optional[str] = Query(None, description="Filter by category"),
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0)
+    min_price: Optional[float] = Query(None, ge=0, description="Minimum price"),
+    max_price: Optional[float] = Query(None, ge=0, description="Maximum price"),
+    min_sentiment: Optional[float] = Query(None, ge=0, le=1, description="Minimum sentiment score"),
+    min_popularity: Optional[float] = Query(None, ge=0, le=1, description="Minimum popularity score"),
+    limit: int = Query(50, ge=1, le=100, description="Number of results"),
+    offset: int = Query(0, ge=0, description="Offset for pagination")
 ):
-    """Get festivals with optional filters"""
+    """Get festivals with advanced filtering"""
     try:
         filters = {}
         if city:
             filters['city'] = city
+        if state:
+            filters['state'] = state
         if category:
             filters['category'] = category
+        if min_price is not None:
+            filters['min_price'] = min_price
+        if max_price is not None:
+            filters['max_price'] = max_price
+        if min_sentiment is not None:
+            filters['min_sentiment'] = min_sentiment
+        if min_popularity is not None:
+            filters['min_popularity'] = min_popularity
         
-        result = await supabase_manager.get_festivals(limit + offset, filters)
+        result = await supabase_manager.get_festivals(limit, filters, offset)
         
         if not result.data:
             return FestivalListResponse(festivals=[], total=0, limit=limit, offset=offset)
         
-        # Apply pagination
-        festivals = result.data[offset:offset + limit]
-        
         # Convert to Pydantic models
         festival_objects = []
-        for festival in festivals:
+        for festival in result.data:
             try:
                 festival_obj = FestivalResponse(**festival)
                 festival_objects.append(festival_obj)
@@ -105,13 +131,10 @@ async def get_festival(festival_id: int):
 async def create_festival(festival: FestivalCreate):
     """Create a new festival with AI processing"""
     try:
-        # Convert to dict
-        festival_data = festival.dict()
+        # Process festival data with AI
+        processed_data = await data_processor.process_festival(festival.dict())
         
-        # Process with AI
-        processed_data = await data_processor.process_festival(festival_data)
-        
-        # Save to Supabase
+        # Create festival in database
         result = await supabase_manager.create_festival(processed_data)
         
         if not result.data:
@@ -119,74 +142,197 @@ async def create_festival(festival: FestivalCreate):
         
         return FestivalResponse(**result.data[0])
     
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating festival: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/search")
-async def search_festivals(
-    q: str = Query(..., description="Search query"),
-    limit: int = Query(20, ge=1, le=50)
-):
-    """Basic text search for festivals"""
+@app.put("/api/festivals/{festival_id}", response_model=FestivalResponse)
+async def update_festival(festival_id: int, festival: FestivalUpdate):
+    """Update a festival"""
     try:
-        # Simple text search in Supabase
-        query = supabase_manager.client.table("festivals").select("*")
+        # Get existing festival
+        existing = await supabase_manager.get_festival_by_id(festival_id)
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Festival not found")
         
-        # Search in name, venue, city, and description
-        search_filter = f"name.ilike.%{q}%,venue.ilike.%{q}%,city.ilike.%{q}%,description.ilike.%{q}%"
+        # Update only provided fields
+        update_data = festival.dict(exclude_unset=True)
         
-        result = query.or_(search_filter).limit(limit).execute()
+        # Re-process with AI if description or name changed
+        if 'description' in update_data or 'name' in update_data:
+            existing_data = existing.data[0]
+            existing_data.update(update_data)
+            processed_data = await data_processor.process_festival(existing_data)
+            update_data.update({
+                'ai_summary': processed_data.get('ai_summary'),
+                'sentiment_score': processed_data.get('sentiment_score'),
+                'popularity_score': processed_data.get('popularity_score'),
+                'category': processed_data.get('category')
+            })
         
-        return {
-            "festivals": result.data,
-            "query": q,
-            "total": len(result.data)
-        }
+        result = await supabase_manager.update_festival(festival_id, update_data)
+        
+        if not result.data:
+            raise HTTPException(status_code=400, detail="Failed to update festival")
+        
+        return FestivalResponse(**result.data[0])
     
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Search error: {e}")
-        raise HTTPException(status_code=500, detail="Search failed")
+        logger.error(f"Error updating festival {festival_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/categories")
-async def get_categories():
-    """Get all available categories"""
+@app.delete("/api/festivals/{festival_id}")
+async def delete_festival(festival_id: int):
+    """Delete a festival"""
     try:
-        # Get unique categories from database
-        result = supabase_manager.client.table("festivals").select("category").execute()
+        result = await supabase_manager.delete_festival(festival_id)
         
-        categories = list(set(
-            item['category'] for item in result.data 
-            if item.get('category')
-        ))
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Festival not found")
         
-        return {"categories": sorted(categories)}
+        return {"message": "Festival deleted successfully"}
     
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error getting categories: {e}")
-        return {"categories": ["music_festival", "food_festival", "art_festival", "general"]}
+        logger.error(f"Error deleting festival {festival_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.get("/api/stats")
-async def get_stats():
-    """Get basic app statistics"""
+@app.post("/api/festivals/search", response_model=FestivalListResponse)
+async def search_festivals(search_request: FestivalSearchRequest):
+    """Advanced search with multiple parameters"""
     try:
-        result = await supabase_manager.get_festivals(limit=1000)
-        total_festivals = len(result.data)
+        search_params = search_request.dict()
+        result = await supabase_manager.search_festivals(search_params)
         
-        categories = {}
+        if not result.data:
+            return FestivalListResponse(
+                festivals=[], 
+                total=0, 
+                limit=search_request.limit, 
+                offset=search_request.offset
+            )
+        
+        # Convert to Pydantic models
+        festival_objects = []
         for festival in result.data:
-            cat = festival.get('category', 'unknown')
-            categories[cat] = categories.get(cat, 0) + 1
+            try:
+                festival_obj = FestivalResponse(**festival)
+                festival_objects.append(festival_obj)
+            except Exception as e:
+                logger.warning(f"Skipping invalid festival data: {e}")
+                continue
         
-        return {
-            "total_festivals": total_festivals,
-            "categories": categories,
-            "status": "operational"
-        }
+        return FestivalListResponse(
+            festivals=festival_objects,
+            total=len(result.data),
+            limit=search_request.limit,
+            offset=search_request.offset
+        )
     
     except Exception as e:
-        logger.error(f"Stats error: {e}")
-        return {"total_festivals": 0, "categories": {}, "status": "error"}
+        logger.error(f"Error searching festivals: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/festivals/stats", response_model=FestivalStatsResponse)
+async def get_festival_stats():
+    """Get festival statistics and insights"""
+    try:
+        stats = await supabase_manager.get_festival_stats()
+        return FestivalStatsResponse(**stats)
+    
+    except Exception as e:
+        logger.error(f"Error getting festival stats: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/festivals/popular", response_model=FestivalListResponse)
+async def get_popular_festivals(
+    min_popularity: float = Query(0.7, ge=0, le=1, description="Minimum popularity score"),
+    limit: int = Query(20, ge=1, le=100, description="Number of results")
+):
+    """Get festivals with high popularity scores"""
+    try:
+        result = await supabase_manager.get_popular_festivals(min_popularity, limit)
+        
+        if not result.data:
+            return FestivalListResponse(festivals=[], total=0, limit=limit, offset=0)
+        
+        festival_objects = [FestivalResponse(**festival) for festival in result.data]
+        
+        return FestivalListResponse(
+            festivals=festival_objects,
+            total=len(result.data),
+            limit=limit,
+            offset=0
+        )
+    
+    except Exception as e:
+        logger.error(f"Error getting popular festivals: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/festivals/positive", response_model=FestivalListResponse)
+async def get_positive_sentiment_festivals(
+    min_sentiment: float = Query(0.7, ge=0, le=1, description="Minimum sentiment score"),
+    limit: int = Query(20, ge=1, le=100, description="Number of results")
+):
+    """Get festivals with positive sentiment"""
+    try:
+        result = await supabase_manager.get_positive_sentiment_festivals(min_sentiment, limit)
+        
+        if not result.data:
+            return FestivalListResponse(festivals=[], total=0, limit=limit, offset=0)
+        
+        festival_objects = [FestivalResponse(**festival) for festival in result.data]
+        
+        return FestivalListResponse(
+            festivals=festival_objects,
+            total=len(result.data),
+            limit=limit,
+            offset=0
+        )
+    
+    except Exception as e:
+        logger.error(f"Error getting positive sentiment festivals: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/festivals/category/{category}", response_model=FestivalListResponse)
+async def get_festivals_by_category(
+    category: str,
+    limit: int = Query(50, ge=1, le=100, description="Number of results"),
+    offset: int = Query(0, ge=0, description="Offset for pagination")
+):
+    """Get festivals by category"""
+    try:
+        result = await supabase_manager.get_festivals_by_category(category, limit)
+        
+        if not result.data:
+            return FestivalListResponse(festivals=[], total=0, limit=limit, offset=offset)
+        
+        festival_objects = [FestivalResponse(**festival) for festival in result.data]
+        
+        return FestivalListResponse(
+            festivals=festival_objects,
+            total=len(result.data),
+            limit=limit,
+            offset=offset
+        )
+    
+    except Exception as e:
+        logger.error(f"Error getting festivals by category {category}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": "2024-01-01T00:00:00Z",
+        "version": "2.0.0"
+    }
 
 if __name__ == "__main__":
     import uvicorn
